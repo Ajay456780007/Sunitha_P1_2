@@ -1,0 +1,133 @@
+import os
+import cv2
+import numpy as np
+import tensorflow as tf
+from skfuzzy.cluster import cmeans
+
+from TransUNet_tf_main.transunet import encoder_layers, decoder_layers
+
+model = tf.keras.models.load_model(
+    "transunet_model.h5",
+    custom_objects={
+        "AddPositionEmbs": encoder_layers.AddPositionEmbs,
+        "TransformerBlock": encoder_layers.TransformerBlock,
+        "DecoderCup": decoder_layers.DecoderCup,
+        "SegmentationHead": decoder_layers.SegmentationHead
+    },
+    compile=False
+)
+
+IMG_SIZE = 224
+YIELD_FACTOR = 0.0001
+
+# Thresholds (you can tune these later)
+LOW_THR = 2
+HIGH_THR = 5
+
+def preprocess_image(image_path):
+    img = cv2.imread(image_path)
+    original = img.copy()
+
+    img = cv2.resize(img, (IMG_SIZE, IMG_SIZE))
+    img = img / 255.0
+    img = np.expand_dims(img, axis=0)
+
+    return img, original
+
+
+def process_image(image_path):
+    img, original = preprocess_image(image_path)
+
+    # --- Segmentation ---
+    pred = model.predict(img, verbose=0)
+    pred_mask = np.argmax(pred, axis=-1)[0]
+    pred_mask = cv2.resize(pred_mask.astype('float32'),
+                           (original.shape[1], original.shape[0]))
+
+    # --- Remove background ---
+    segmented = original.copy()
+    segmented[pred_mask == 0] = [0, 0, 0]
+
+    seg_rgb = cv2.cvtColor(segmented, cv2.COLOR_BGR2RGB)
+
+    # --- Foreground mask ---
+    mask_fg = (pred_mask != 0)
+
+    if np.sum(mask_fg) == 0:
+        return 0, "No Yield"
+
+    # --- Extract valid pixels ---
+    valid_pixels = seg_rgb[mask_fg]
+    pixels = valid_pixels.T.astype(np.float64)
+
+    # --- FCM ---
+    n_clusters = 3
+    cntr, u, _, _, _, _, _ = cmeans(
+        pixels,
+        c=n_clusters,
+        m=2,
+        error=0.005,
+        maxiter=1000
+    )
+
+    cluster_labels = np.argmax(u, axis=0)
+
+    # --- Find flower cluster (brightest) ---
+    cluster_means = []
+    for i in range(n_clusters):
+        cluster_pixels = valid_pixels[cluster_labels == i]
+        mean_color = np.mean(cluster_pixels, axis=0)
+        cluster_means.append(mean_color)
+
+    cluster_means = np.array(cluster_means)
+    brightness = np.sum(cluster_means, axis=1)
+
+    flower_cluster = np.argmax(brightness)
+
+    # --- Build mask correctly ---
+    fcm_mask = np.zeros(seg_rgb.shape[:2], dtype=np.uint8)
+    fcm_mask[mask_fg] = (cluster_labels == flower_cluster).astype(np.uint8)
+
+    # --- Final output ---
+    final_output = np.zeros_like(seg_rgb)
+    final_output[fcm_mask == 1] = seg_rgb[fcm_mask == 1]
+
+    # --- Yield Calculation ---
+    pixel_count = np.count_nonzero(fcm_mask)
+    predicted_yield = pixel_count * YIELD_FACTOR
+
+    # --- Classification ---
+    if predicted_yield < LOW_THR:
+        category = "Low Yield"
+    elif predicted_yield < HIGH_THR:
+        category = "Average Yield"
+    else:
+        category = "High Yield"
+
+    return predicted_yield, category
+
+dataset_path = "Dataset/"
+results = []
+
+for file in os.listdir(dataset_path):
+    if file.lower().endswith((".jpg", ".png", ".jpeg")):
+        path = os.path.join(dataset_path, file)
+
+        try:
+            yield_val, category = process_image(path)
+
+            results.append({
+                "image": file,
+                "yield": round(yield_val, 3),
+                "category": category
+            })
+
+            print(f"{file} → Yield: {yield_val:.3f} → {category}")
+
+        except Exception as e:
+            print(f"Error processing {file}: {e}")
+
+
+print("\nFinal Results:")
+for r in results:
+    print(r)
